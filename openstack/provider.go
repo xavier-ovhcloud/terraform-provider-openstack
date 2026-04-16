@@ -510,6 +510,11 @@ func Provider() *schema.Provider {
 		},
 	}
 
+	// Merge OIDC schema attributes into the provider schema.
+	for k, v := range oidcProviderSchema() {
+		provider.Schema[k] = v
+	}
+
 	provider.ConfigureContextFunc = func(ctx context.Context, d *schema.ResourceData) (any, diag.Diagnostics) {
 		return configureProvider(ctx, provider, d)
 	}
@@ -553,6 +558,52 @@ func configureProvider(ctx context.Context, provider *schema.Provider, d *schema
 				enableLogging = true
 			}
 		}
+	}
+
+	// Check for OIDC authentication before the standard auth flow.
+	// If an OIDC auth_type is detected, authenticate via OIDC to obtain a
+	// scoped Keystone token, then feed it into the standard Config so that
+	// service catalog discovery and endpoint resolution work correctly.
+	if pc, oidcDiags := configureOIDCClient(ctx, d); pc != nil || oidcDiags.HasError() {
+		if oidcDiags.HasError() {
+			return nil, oidcDiags
+		}
+
+		oidcConfig := Config{
+			auth.Config{
+				CACertFile:           d.Get("cacert_file").(string),
+				ClientCertFile:       d.Get("cert").(string),
+				ClientKeyFile:        d.Get("key").(string),
+				EndpointOverrides:    d.Get("endpoint_overrides").(map[string]any),
+				EndpointType:         d.Get("endpoint_type").(string),
+				IdentityEndpoint:     d.Get("auth_url").(string),
+				Region:               d.Get("region").(string),
+				Token:                pc.TokenID,
+				TenantID:             d.Get("tenant_id").(string),
+				AllowReauth:          d.Get("allow_reauth").(bool),
+				MaxRetries:           d.Get("max_retries").(int),
+				DisableNoCacheHeader: d.Get("disable_no_cache_header").(bool),
+				UseOctavia:           true,
+				TerraformVersion:     terraformVersion,
+				SDKVersion:           getSDKVersion() + " Terraform Provider OpenStack/" + version,
+				MutexKV:              mutexkv.NewMutexKV(),
+				EnableLogger:         enableLogging,
+				AuthOpts: &gophercloud.AuthOptions{
+					Scope: &gophercloud.AuthScope{System: d.Get("system_scope").(bool)},
+				},
+			},
+		}
+
+		if v, ok := getOkExists(d, "insecure"); ok {
+			insecure := v.(bool)
+			oidcConfig.Insecure = &insecure
+		}
+
+		if err := oidcConfig.LoadAndValidate(ctx); err != nil {
+			return nil, diag.FromErr(err)
+		}
+
+		return &oidcConfig, nil
 	}
 
 	authOpts := &gophercloud.AuthOptions{
